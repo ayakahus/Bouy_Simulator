@@ -1,0 +1,24 @@
+{
+  "profile_name": "llama31_8b_bf16_example",
+  "description": "Illustrative capacity budget, not a claim about a specific production deployment.",
+  "model": {
+    "name": "Llama 3.1 8B",
+    "kv_dtype": "BF16",
+    "num_layers": 32,
+    "num_kv_heads": 8,
+    "head_dim": 128,
+    "bytes_per_element": 2
+  },
+  "cache": {
+    "block_size_tokens": 16,
+    "kv_bytes_per_token": 131072,
+    "kv_bytes_per_block": 2097152,
+    "hbm_budget_gib": 32,
+    "dram_budget_gib": 128,
+    "hbm_capacity_chunks": 16384,
+    "dram_capacity_chunks": 65536,
+    "ghost_capacity_ids": 65536
+  },
+  "run_command": "python run_simulation.py --trace examples/production_like_trace.jsonl --policy both --hbm-capacity 16384 --dram-capacity 65536 --ghost-capacity 65536 --block-size 16 --output-dir results_production_capacity",
+  "scaled_smoke_test_command": "python run_simulation.py --trace examples/production_like_trace.jsonl --policy both --hbm-capacity 2048 --dram-capacity 8192 --ghost-capacity 8192 --block-size 16 --output-dir results_scaled"
+}

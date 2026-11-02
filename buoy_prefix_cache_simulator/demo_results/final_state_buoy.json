@@ -1,0 +1,47 @@
+{
+  "policy": "buoy",
+  "hbm_oldest_to_newest": [
+    {
+      "chunk_id": "a682d65783253579df8867c313ee7e71",
+      "depth": 3,
+      "visited": true
+    },
+    {
+      "chunk_id": "64a56d4632ca2a50606a3eb3a356e166",
+      "depth": 2,
+      "visited": true
+    },
+    {
+      "chunk_id": "486689e2f04ff39919ea52bb8e9df79e",
+      "depth": 1,
+      "visited": true
+    }
+  ],
+  "dram_oldest_to_newest": [
+    {
+      "chunk_id": "70e56da14cb87ae7c5bef351fb0838cf",
+      "depth": 1,
+      "visited": false
+    }
+  ],
+  "ghost_oldest_to_newest": [
+    "8eb1851c9f1baf0ed0a24e1925fd0fc4",
+    "1a13c5e490517f8b258208f7987ccefe",
+    "f10fb11042c6b75bdf4101fba76cb3a5",
+    "fe6e8b2c84c5557079b724897bbfbcd5"
+  ],
+  "depth_threshold": 1,
+  "reuse_events": 8,
+  "stats": {
+    "total_chunks": 18,
+    "hbm_hits": 5,
+    "dram_hits": 3,
+    "misses": 10,
+    "admitted_chunks": 4,
+    "rejected_chunks": 6,
+    "evictions": 0,
+    "demotions": 0,
+    "ghost_hits": 2,
+    "second_chances": 0
+  }
+}

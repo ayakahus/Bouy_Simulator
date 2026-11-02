@@ -1,0 +1,22 @@
+{
+  "trace": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/examples/sharegpt5k_llama31_real.jsonl",
+  "block_size": 16,
+  "initial_depth_threshold": 1,
+  "total_capacities": [
+    16384,
+    65536,
+    131072,
+    262144,
+    524288
+  ],
+  "hbm_fraction": 0.2,
+  "ghost_to_hbm": 4.0,
+  "policies": [
+    "buoy",
+    "buoy_noadmission",
+    "lru"
+  ],
+  "output_dir": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/results/dram_write_sweep_sharegpt5k",
+  "plot": true,
+  "plot_dpi": 200
+}

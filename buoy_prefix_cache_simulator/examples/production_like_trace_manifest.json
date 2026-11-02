@@ -1,0 +1,16 @@
+{
+  "requests": 611,
+  "sessions": 120,
+  "time_span_seconds": 3897.946,
+  "prompt_tokens_total": 803080,
+  "prompt_tokens_min": 418,
+  "prompt_tokens_median": 1244,
+  "prompt_tokens_max": 3468,
+  "workload_classes": {
+    "research": 188,
+    "coding": 113,
+    "browser": 113,
+    "data": 197
+  },
+  "note": "Synthetic workload, not real production data; tokens are stable token-like strings, not real tokenizer IDs."
+}

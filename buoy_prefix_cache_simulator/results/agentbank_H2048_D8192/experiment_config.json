@@ -1,0 +1,27 @@
+{
+  "trace": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/examples/agentbank_apps_llama31_real.jsonl",
+  "policies": [
+    "buoy",
+    "lru"
+  ],
+  "hbm_capacity": 2048,
+  "dram_capacity": 8192,
+  "ghost_capacity": 8192,
+  "block_size": 16,
+  "initial_depth_threshold": 1,
+  "disable_admission": false,
+  "output_dir": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/results/agentbank_H2048_D8192",
+  "plots": [
+    "summary_bars",
+    "cumulative",
+    "tier_breakdown"
+  ],
+  "plot_dpi": 200,
+  "length_bucket_edges": [
+    1000,
+    2000,
+    4000,
+    null
+  ],
+  "time_bucket_count": 10
+}

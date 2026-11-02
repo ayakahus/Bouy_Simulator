@@ -1,0 +1,3 @@
+policy,requests,prompt_tokens,chunk_accesses,hbm_hits,dram_hits,hit_chunks,miss_chunks,chunk_hit_rate,token_hit_rate,estimated_prefill_tokens_saved,hbm_hit_rate,dram_hit_rate,admitted_chunks,rejected_chunks,evictions,demotions,ghost_hits,second_chances,final_depth_threshold,reuse_events
+buoy,611,803080,50482,13368,2714,16082,34400,0.3185689948892675,0.3204064352243861,257312,0.26480725803256605,0.0537617368567014,3801,30599,0,666,3783,0,16,16082
+lru,611,803080,50482,19453,364,19817,30665,0.3925557624499822,0.39481994321860836,317072,0.38534527158195,0.0072104908680321695,30665,0,20425,28981,0,0,,

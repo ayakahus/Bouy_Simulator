@@ -1,0 +1,23 @@
+{
+  "trace": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/examples/agentbank_apps_llama31_real.jsonl",
+  "block_size": 16,
+  "initial_depth_threshold": 1,
+  "total_capacities": [
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072
+  ],
+  "hbm_fraction": 0.2,
+  "ghost_to_hbm": 4.0,
+  "policies": [
+    "buoy",
+    "buoy_noadmission",
+    "lru"
+  ],
+  "output_dir": "/home/fzz27/buoy_prefix_cache_simulator_production_profile/buoy_prefix_cache_simulator/results/dram_write_sweep",
+  "plot": true,
+  "plot_dpi": 200
+}
