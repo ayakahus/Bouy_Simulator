@@ -29,7 +29,7 @@ try:
 except ImportError:
     HAS_MPL = False
 
-from buoy_sim.policies import BuoyPolicy, LRUPolicy
+from buoy_sim.policies import BuoyPolicy, LRUPolicy, S3FIFOPolicy
 from buoy_sim.simulator import run_policy, write_csv
 from buoy_sim.trace import load_trace
 
@@ -42,7 +42,7 @@ CONFIG: dict = {
     #   trace/quac_llama31_real.jsonl           (QuAC multi-turn QA, 14,451 reqs)
     #   trace/agentbank_apps_llama31_real.jsonl (AgentBank agents, 4,408 reqs)
     "trace": PROJECT_ROOT / "examples" / "production_like_trace.jsonl",
-    # Policies to run and compare: any subset of ["buoy", "lru"]
+    # Policies to run and compare: any subset of ["buoy", "lru", "s3fifo"]
     "policies": ["buoy", "lru"],
     # ---- cache parameters (capacities are in chunks, not bytes) ----------------
     # Production-like profile from configs/llama31_8b_bf16_example.json.
@@ -82,7 +82,10 @@ def build_policy(name: str, cfg: dict):
                           admission=not cfg["disable_admission"])
     if name == "lru":
         return LRUPolicy(cfg["hbm_capacity"], cfg["dram_capacity"])
-    raise ValueError(f"unknown policy {name!r}; choose from 'buoy', 'lru'")
+    if name == "s3fifo":
+        return S3FIFOPolicy(cfg["hbm_capacity"], cfg["dram_capacity"],
+                            cfg.get("ghost_capacity", 4096))
+    raise ValueError(f"unknown policy {name!r}; choose from 'buoy', 'lru', 's3fifo'")
 
 
 def _color(i: int) -> str:

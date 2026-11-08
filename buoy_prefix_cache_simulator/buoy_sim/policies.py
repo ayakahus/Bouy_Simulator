@@ -1,4 +1,4 @@
-"""Cache replacement policies: Buoy and LRU."""
+"""Cache replacement policies: Buoy, LRU, and S3-FIFO."""
 from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -10,6 +10,7 @@ class Chunk:
     depth: int
     token_count: int
     visited: bool = False
+    freq: int = 0  # S3-FIFO frequency counter (unused by Buoy/LRU)
 
 class BuoyPolicy:
     name = "buoy"
@@ -274,5 +275,174 @@ class LRUPolicy:
             "policy": self.name,
             "hbm_oldest_to_newest": [{"chunk_id": c, "depth": n.depth} for c, n in self.hbm.items()],
             "dram_oldest_to_newest": [{"chunk_id": c, "depth": n.depth} for c, n in self.dram.items()],
+            "stats": self.stats,
+        }
+
+class S3FIFOPolicy:
+    """S3-FIFO (Yang et al., "FIFO Queues Are All You Need for Cache Eviction",
+    SOSP 2023) with HBM as the small FIFO and DRAM as the main FIFO.
+
+    The paper's two-queue design maps onto the storage tiers as follows:
+
+    - **HBM = small FIFO (S)**: every admitted chunk enters HBM with
+      ``freq = 0``. When HBM overflows, the queue head is examined: a chunk
+      re-accessed while queued (``freq >= move_to_main_threshold``) moves to
+      the DRAM queue tail with freq reset; a never-re-accessed chunk is
+      evicted and its ID recorded in the ghost FIFO.
+    - **DRAM = main FIFO (M)**: holds chunks that proved popular in HBM.
+      Overflow is resolved with a 2-bit Clock: a chunk with ``freq > 0`` is
+      reinserted at the tail with ``freq -= 1`` (second chance); a chunk with
+      ``freq == 0`` is evicted.
+    - **Ghost FIFO** (IDs only, no chunk data): a miss whose ID is in the
+      ghost — i.e. the chunk was evicted from HBM and requested again —
+      bypasses the HBM trial queue and is admitted straight to DRAM.
+
+    Unlike LRU, hits never move a chunk between tiers or within a queue; they
+    only bump a small frequency counter. Per-hit work is O(1), HBM writes are
+    limited to fresh admissions (no promote-on-hit), and one-shot chunks are
+    evicted FIFO-fast instead of polluting the hot tier.
+    """
+
+    name = "s3fifo"
+
+    def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 4096,
+                 move_to_main_threshold: int = 1, **kwargs):
+        if hbm_capacity < 0 or dram_capacity < 0 or ghost_capacity < 0:
+            raise ValueError("capacities must be >= 0")
+        self.hcap, self.mcap, self.gcap = hbm_capacity, dram_capacity, ghost_capacity
+        # Paper default: one re-access inside the small queue promotes a chunk
+        # to the main queue ("accessed at least twice" counting admission).
+        self.move_to_main_threshold = max(1, move_to_main_threshold)
+        # OrderedDict order: oldest/tail at the beginning, newest/head at the end.
+        self.hbm: OrderedDict[str, Chunk] = OrderedDict()
+        self.dram: OrderedDict[str, Chunk] = OrderedDict()
+        self.ghost: deque[str] = deque()
+        self.ghost_set: set[str] = set()
+        self.stats = dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
+                          admitted_chunks=0, rejected_chunks=0, evictions=0,
+                          demotions=0, ghost_hits=0, second_chances=0)
+
+    # ---- ghost FIFO (IDs only) -------------------------------------------------
+    def _ghost_contains(self, cid: str) -> bool:
+        return cid in self.ghost_set
+
+    def _ghost_add(self, cid: str):
+        if self.gcap <= 0:
+            return
+        if cid in self.ghost_set:
+            # FIFO semantics: refresh by removing and appending, keeping one copy.
+            try:
+                self.ghost.remove(cid)
+            except ValueError:
+                pass
+        self.ghost.append(cid)
+        self.ghost_set.add(cid)
+        while len(self.ghost) > self.gcap:
+            old = self.ghost.popleft()
+            self.ghost_set.discard(old)
+
+    def _ghost_remove(self, cid: str):
+        if cid in self.ghost_set:
+            self.ghost_set.discard(cid)
+            try:
+                self.ghost.remove(cid)
+            except ValueError:
+                pass
+
+    # ---- queue helpers ----------------------------------------------------------
+    def _insert_head(self, queue: OrderedDict[str, Chunk], node: Chunk):
+        queue[node.chunk_id] = node
+        queue.move_to_end(node.chunk_id, last=True)
+
+    def _trim_dram(self):
+        """Resolve DRAM (main queue) overflow with 2-bit Clock second chances.
+
+        Per the paper, main-queue evictions do NOT enter the ghost: only
+        small-queue evictions do. The freq decrement guarantees termination;
+        the guard mirrors BuoyPolicy's defense against pathological configs.
+        """
+        guard = 0
+        limit = max(10, 4 * (len(self.dram) + 1))
+        while self.dram and len(self.dram) > self.mcap:
+            guard += 1
+            cid, node = self.dram.popitem(last=False)
+            if node.freq >= 1 and guard <= limit:
+                node.freq -= 1
+                self.stats["second_chances"] += 1
+                self._insert_head(self.dram, node)
+            else:
+                self.stats["evictions"] += 1
+
+    def _trim_hbm(self):
+        """Resolve HBM (small queue) overflow: promote hot heads, evict cold ones.
+
+        Re-accessed chunks move to the DRAM tail with freq reset (paper
+        semantics); never-re-accessed chunks are evicted and recorded in the
+        ghost FIFO so a prompt re-request can skip the HBM trial queue. With
+        ``dram_capacity == 0`` there is no main queue, so promotions degrade
+        to plain evictions.
+        """
+        while len(self.hbm) > self.hcap:
+            cid, node = self.hbm.popitem(last=False)
+            if node.freq >= self.move_to_main_threshold and self.mcap > 0:
+                node.freq = 0
+                self._insert_head(self.dram, node)
+                self.stats["demotions"] += 1
+                self._trim_dram()
+            else:
+                self._ghost_add(cid)
+                self.stats["evictions"] += 1
+
+    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+        """Process one request's prefix chunks in root-to-leaf order."""
+        self.stats["total_chunks"] += len(chunks)
+        hbm_hits = dram_hits = misses = hits_tokens = 0
+        for cid, depth, token_count in chunks:
+            node = self.hbm.get(cid)
+            if node is not None:
+                # Hit in the small queue: bump the frequency bit, move nothing.
+                node.depth, node.token_count = depth, token_count
+                node.freq = min(node.freq + 1, self.move_to_main_threshold)
+                hbm_hits += 1
+                hits_tokens += token_count
+                continue
+            node = self.dram.get(cid)
+            if node is not None:
+                # Hit in the main queue: 2-bit clock counter, move nothing.
+                node.depth, node.token_count = depth, token_count
+                node.freq = min(node.freq + 1, 3)
+                dram_hits += 1
+                hits_tokens += token_count
+                continue
+            misses += 1
+            self.stats["misses"] += 1
+            in_ghost = self._ghost_contains(cid)
+            if in_ghost:
+                self.stats["ghost_hits"] += 1
+                self._ghost_remove(cid)
+            if self.mcap > 0 and (in_ghost or self.hcap == 0):
+                # Ghost members skip the HBM trial queue (paper admission rule);
+                # with no HBM configured, every chunk enters DRAM directly.
+                self.stats["admitted_chunks"] += 1
+                self._insert_head(self.dram, Chunk(cid, depth, token_count))
+                self._trim_dram()
+            elif self.hcap > 0:
+                self.stats["admitted_chunks"] += 1
+                self._insert_head(self.hbm, Chunk(cid, depth, token_count))
+                self._trim_hbm()
+            # else: no capacity configured anywhere; count as a miss only.
+        self.stats["hbm_hits"] += hbm_hits
+        self.stats["dram_hits"] += dram_hits
+        return dict(hbm_hits=hbm_hits, dram_hits=dram_hits, misses=misses,
+                    hit_chunks=hbm_hits + dram_hits, hit_tokens=hits_tokens,
+                    request_tokens=sum(c[2] for c in chunks))
+
+    def snapshot(self):
+        return {
+            "policy": self.name,
+            "hbm_oldest_to_newest": [{"chunk_id": c, "depth": n.depth, "freq": n.freq} for c, n in self.hbm.items()],
+            "dram_oldest_to_newest": [{"chunk_id": c, "depth": n.depth, "freq": n.freq} for c, n in self.dram.items()],
+            "ghost_oldest_to_newest": list(self.ghost),
+            "move_to_main_threshold": self.move_to_main_threshold,
             "stats": self.stats,
         }

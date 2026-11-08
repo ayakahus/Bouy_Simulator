@@ -1,0 +1,4 @@
+trace,requests,block_accesses,cap_label,total_capacity,hbm_capacity,dram_capacity,ghost_capacity,policy,chunk_hit_rate,hbm_hits,dram_hits,misses,hbm_hit_rate,dram_hit_rate,hbm_share_of_hits,dram_share_of_hits,admitted_chunks,rejected_chunks,demotions,evictions,ghost_hits,second_chances,unique_chunks,elapsed_s
+QwenTraceA,43058,6293976,large,2656400,265640,2390760,1062560,buoy,0.453646,2028840,826397,3438739,0.322346,0.1313,0.710568,0.289432,1691713,1747026,560757,0,782339,0,2656400,11.8
+QwenTraceA,43058,6293976,large,2656400,265640,2390760,1062560,lru,0.577946,3160091,477485,2656400,0.502082,0.075864,0.868735,0.131265,2656400,0,2868245,0,0,0,2656400,8.7
+QwenTraceA,43058,6293976,large,2656400,265640,2390760,1062560,s3fifo,0.553618,1938712,1545744,2809520,0.308027,0.245591,0.556389,0.443611,2809520,0,960742,1430052,153086,0,2656400,11.0

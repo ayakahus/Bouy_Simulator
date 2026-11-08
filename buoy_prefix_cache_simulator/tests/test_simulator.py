@@ -1,6 +1,6 @@
 import unittest
 from buoy_sim.trace import Request, prefix_chunks
-from buoy_sim.policies import BuoyPolicy, LRUPolicy
+from buoy_sim.policies import BuoyPolicy, LRUPolicy, S3FIFOPolicy
 from buoy_sim.simulator import run_policy
 
 class SimulatorTests(unittest.TestCase):
@@ -35,6 +35,67 @@ class SimulatorTests(unittest.TestCase):
         result = p.access_request(prefix_chunks(["a", "c"], 1))
         self.assertEqual(result["dram_hits"], 1)
         self.assertEqual(result["hbm_hits"], 0)
+
+    def test_s3fifo_capacity_is_bounded(self):
+        p = S3FIFOPolicy(2, 3)
+        for tok in ["a", "b", "c", "d", "e", "f", "g"]:
+            p.access_request(prefix_chunks([tok], 1))
+        self.assertLessEqual(len(p.hbm), 2)
+        self.assertLessEqual(len(p.dram), 3)
+
+    def test_s3fifo_promotes_reaccessed_hbm_chunk_to_dram(self):
+        # A chunk re-accessed while queued in HBM is promoted to DRAM (not
+        # evicted) when HBM overflows, and then hits in DRAM.
+        p = S3FIFOPolicy(1, 2)
+        c1 = prefix_chunks(["x"], 1)[0]
+        c2 = prefix_chunks(["y"], 1)[0]
+        p.access_request([c1])   # miss -> HBM (small queue), freq = 0
+        p.access_request([c1])   # HBM hit -> freq bump, no movement
+        p.access_request([c2])   # HBM overflow -> re-accessed c1 promoted to DRAM
+        self.assertEqual(p.stats["demotions"], 1)
+        self.assertEqual(len(p.hbm), 1)
+        self.assertEqual(len(p.dram), 1)
+        result = p.access_request([c1])
+        self.assertEqual(result["dram_hits"], 1)
+        self.assertEqual(result["hbm_hits"], 0)
+
+    def test_s3fifo_evicts_cold_chunk_and_ghost_hit_skips_to_dram(self):
+        # A never-re-accessed chunk evicted from HBM enters the ghost; its next
+        # request is a ghost hit admitted straight to DRAM, skipping the trial.
+        p = S3FIFOPolicy(1, 2, ghost_capacity=8)
+        c1 = prefix_chunks(["x"], 1)[0]
+        c2 = prefix_chunks(["y"], 1)[0]
+        p.access_request([c1])   # c1 enters HBM, never re-accessed
+        p.access_request([c2])   # HBM overflow -> cold c1 evicted into ghost
+        self.assertEqual(p.stats["evictions"], 1)
+        self.assertIn(c1[0], p.ghost_set)
+        result = p.access_request([c1])  # ghost hit -> straight to DRAM
+        self.assertEqual(result["misses"], 1)
+        self.assertEqual(p.stats["ghost_hits"], 1)
+        self.assertIn(c1[0], p.dram)
+        self.assertNotIn(c1[0], p.hbm)
+        result = p.access_request([c1])  # stays cached in DRAM
+        self.assertEqual(result["dram_hits"], 1)
+
+    def test_s3fifo_second_chance_on_dram_overflow(self):
+        # DRAM eviction is 2-bit Clock: a re-accessed chunk first gets its freq
+        # decremented (second chance) before it is finally evicted.
+        p = S3FIFOPolicy(1, 1, ghost_capacity=8)
+        c1 = prefix_chunks(["x"], 1)[0]
+        c2 = prefix_chunks(["y"], 1)[0]
+        c3 = prefix_chunks(["z"], 1)[0]
+        c4 = prefix_chunks(["w"], 1)[0]
+        p.access_request([c1])           # HBM
+        p.access_request([c1])           # HBM hit
+        p.access_request([c2])           # promote c1 -> DRAM; c2 stays in HBM
+        p.access_request([c1])           # DRAM hit -> freq 1
+        p.access_request([c2])           # HBM hit
+        p.access_request([c3])           # promote c2 -> DRAM overflow -> c1 second chance
+        self.assertGreater(p.stats["second_chances"], 0)
+        self.assertIn(c1[0], p.dram)     # c1 survived via its second chance
+        p.access_request([c4])           # HBM overflow -> cold c3 evicted
+        result = p.access_request([c1])  # c1 still cached in DRAM
+        self.assertEqual(result["dram_hits"], 1)
 
 if __name__ == "__main__":
     unittest.main()

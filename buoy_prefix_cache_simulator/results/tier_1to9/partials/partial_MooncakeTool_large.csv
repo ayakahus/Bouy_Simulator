@@ -1,0 +1,4 @@
+trace,requests,block_accesses,cap_label,total_capacity,hbm_capacity,dram_capacity,ghost_capacity,policy,chunk_hit_rate,hbm_hits,dram_hits,misses,hbm_hit_rate,dram_hit_rate,hbm_share_of_hits,dram_share_of_hits,admitted_chunks,rejected_chunks,demotions,evictions,ghost_hits,second_chances,unique_chunks,elapsed_s
+MooncakeTool,23608,409616,large,183300,18330,164970,73320,buoy,0.491455,174979,26329,208308,0.427178,0.064277,0.86921,0.13079,80273,128035,7999,0,25008,0,183300,0.5
+MooncakeTool,23608,409616,large,183300,18330,164970,73320,lru,0.552508,207948,18368,183300,0.507666,0.044842,0.918839,0.081161,183300,0,183338,0,0,0,183300,0.4
+MooncakeTool,23608,409616,large,183300,18330,164970,73320,s3fifo,0.537137,57032,162988,189596,0.139233,0.397904,0.259213,0.740787,189596,0,30985,134017,6264,0,183300,0.4
