@@ -1,6 +1,6 @@
 import unittest
 from buoy_sim.trace import Request, prefix_chunks
-from buoy_sim.policies import BuoyPolicy, LRUPolicy, S3FIFOPolicy
+from buoy_sim.policies import BuoyPolicy, LRUPolicy, OPTPolicy, S3FIFOPolicy
 from buoy_sim.simulator import run_policy
 
 class SimulatorTests(unittest.TestCase):
@@ -96,6 +96,47 @@ class SimulatorTests(unittest.TestCase):
         p.access_request([c4])           # HBM overflow -> cold c3 evicted
         result = p.access_request([c1])  # c1 still cached in DRAM
         self.assertEqual(result["dram_hits"], 1)
+
+    def test_opt_known_sequence(self):
+        # Belady MIN on "A B A C B" with capacity 2: M M H M H
+        # (evict A at "C" because A is never used again).
+        p = OPTPolicy(2, 0)
+        cids = [prefix_chunks([t], 1)[0] for t in ["a", "b", "a", "c", "b"]]
+        p.prepare([[c] for c in cids])
+        hits = [p.access_request([c])["hit_chunks"] for c in cids]
+        self.assertEqual(hits, [0, 0, 1, 0, 1])
+
+    def test_opt_dominates_lru(self):
+        # MIN is optimal for the total capacity: its hit count must never be
+        # below any online policy's on the same sequence and capacity.
+        import random
+        rng = random.Random(7)
+        cids = [prefix_chunks([t], 1)[0] for t in (rng.choice("abcdefghij") for _ in range(400))]
+        opt = OPTPolicy(4, 0)
+        opt.prepare([[c] for c in cids])
+        opt_hits = sum(opt.access_request([c])["hit_chunks"] for c in cids)
+        lru = LRUPolicy(4, 0)
+        lru_hits = sum(lru.access_request([c])["hit_chunks"] for c in cids)
+        self.assertGreaterEqual(opt_hits, lru_hits)
+        self.assertLessEqual(len(opt.hbm) + len(opt.dram), 4)
+
+    def test_opt_pulls_soon_needed_chunk_into_hbm(self):
+        # hbm=1, dram=2, sequence a b c b a a. After the first overflows "a"
+        # sits in DRAM; at its i4 DRAM hit its next use (position 5) is sooner
+        # than the HBM worst (b, INF), so the oracle swaps it into HBM (one
+        # demotion) and i5 hits in HBM.
+        p = OPTPolicy(1, 2)
+        cids = [prefix_chunks([t], 1)[0] for t in ["a", "b", "c", "b", "a", "a"]]
+        p.prepare([[c] for c in cids])
+        results = [p.access_request([c]) for c in cids]
+        self.assertEqual([r["hit_chunks"] for r in results], [0, 0, 0, 1, 1, 1])
+        self.assertEqual(results[4]["dram_hits"], 1)
+        self.assertEqual(results[5]["hbm_hits"], 1)
+        self.assertEqual(p.stats["demotions"], 3)
+        self.assertEqual(len(p.hbm), 1)
+        self.assertEqual(len(p.dram), 2)
+        self.assertIn(cids[4][0], p.hbm)   # a pulled into HBM by the oracle
+        self.assertIn(cids[1][0], p.dram)  # b (stale next use) sunk to DRAM
 
 if __name__ == "__main__":
     unittest.main()

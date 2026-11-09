@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""HBM:DRAM = 1:9 tier-hit comparison: Buoy vs LRU vs S3-FIFO on the four
-official hash-block traces (Qwen TraceA/TraceB, Mooncake Conv/Tool).
+"""HBM:DRAM = 1:9 tier-hit comparison: Buoy vs LRU vs S3-FIFO vs Belady OPT
+on the four official hash-block traces (Qwen TraceA/TraceB, Mooncake
+Conv/Tool).
 
 Methodology mirrors hitrate_sml.py: chunk ids are pre-computed once per trace
 (parent-chained blake2b-16, block_size=1 semantics: one simulated chunk == one
@@ -26,7 +27,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from buoy_sim.policies import BuoyPolicy, LRUPolicy, S3FIFOPolicy
+from buoy_sim.policies import BuoyPolicy, LRUPolicy, OPTPolicy, S3FIFOPolicy
 
 BASE = Path(__file__).resolve().parent
 TRACE_DIR = BASE / "trace"
@@ -39,7 +40,7 @@ TRACES = {
     "MooncakeTool": "mooncake_tool_sim.jsonl",
 }
 CAP_LABELS = (("small", 0.05), ("medium", 0.25), ("large", 1.00))
-POLICIES = ("buoy", "lru", "s3fifo")
+POLICIES = ("buoy", "lru", "s3fifo", "opt")
 HBM_FRAC = 0.1  # 1:9 HBM:DRAM
 
 
@@ -122,6 +123,8 @@ def build_policy(name: str, hbm: int, dram: int, ghost: int):
         return LRUPolicy(hbm, dram)
     if name == "s3fifo":
         return FastGhostS3FIFO(hbm, dram, ghost)
+    if name == "opt":
+        return OPTPolicy(hbm, dram)
     raise ValueError(f"unknown policy {name!r}")
 
 
@@ -141,6 +144,9 @@ def worker(trace_name: str, fname: str, cap_label: str, frac: float) -> None:
     rows = []
     for pname in POLICIES:
         policy = build_policy(pname, hbm, dram, ghost)
+        if hasattr(policy, "prepare"):
+            # Offline policies (Belady OPT) need the full access sequence.
+            policy.prepare(chunk_reqs)
         t0 = time.time()
         for cids in chunk_reqs:
             if not cids:
@@ -191,7 +197,7 @@ def plot(rows) -> None:
     matplotlib.use("Agg")  # headless-safe
     import matplotlib.pyplot as plt
 
-    POLICY_COLORS = {"buoy": "tab:blue", "lru": "tab:orange", "s3fifo": "tab:green"}
+    POLICY_COLORS = {"buoy": "tab:blue", "lru": "tab:orange", "s3fifo": "tab:green", "opt": "tab:red"}
     HBM_C, DRAM_C = "#d73027", "#4575b4"  # tier colors: HBM warm, DRAM cool
     caps = [c for c, _ in CAP_LABELS]
     traces = list(TRACES)
@@ -203,10 +209,10 @@ def plot(rows) -> None:
     # fig1: chunk hit rate, grouped bars per capacity point
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), squeeze=False)
     for ax, t in zip(axes.flat, traces):
-        width = 0.26
+        width = 0.8 / len(POLICIES)
         for i, p in enumerate(POLICIES):
             vals = [float(by_tc[(t, c)][p]["chunk_hit_rate"]) * 100 for c in caps]
-            pos = [j + (i - 1) * width for j in range(len(caps))]
+            pos = [j + (i - (len(POLICIES) - 1) / 2) * width for j in range(len(caps))]
             ax.bar(pos, vals, width=width, label=p, color=POLICY_COLORS[p])
         ax.set_xticks(range(len(caps)))
         ax.set_xticklabels([f"{c}\n(total {int(by_tc[(t, c)]['buoy']['total_capacity']):,})"
@@ -266,10 +272,10 @@ def plot(rows) -> None:
     # fig4: HBM->DRAM demotion write traffic, symlog scale
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), squeeze=False)
     for ax, t in zip(axes.flat, traces):
-        width = 0.26
+        width = 0.8 / len(POLICIES)
         for i, p in enumerate(POLICIES):
             vals = [int(by_tc[(t, c)][p]["demotions"]) for c in caps]
-            pos = [j + (i - 1) * width for j in range(len(caps))]
+            pos = [j + (i - (len(POLICIES) - 1) / 2) * width for j in range(len(caps))]
             ax.bar(pos, vals, width=width, label=p, color=POLICY_COLORS[p])
         ax.set_xticks(range(len(caps)))
         ax.set_xticklabels(caps)
@@ -321,6 +327,9 @@ def report() -> None:
     L.append("- **ghost 容量**:4×HBM(buoy 与 s3fifo 使用;LRU 无 ghost)")
     L.append("- **容量点**:small / medium / large = 5% / 25% / 100% × 各轨迹唯一块工作集 W")
     L.append("- **重放语义**:1 个模拟 chunk = 1 个 hash 块(Qwen 16 真实 token/块,Mooncake ≈500 token/块),`block_size=1`")
+    L.append("- **OPT(Belady MIN)**:离线最优基线——对总容量(hbm+dram)做严格 MIN 驱逐,"
+             "oracle 贪心分层(HBM 优先持有下次访问最早的 chunk,只拉不推近似);"
+             "命中率为同容量所有策略的理论上界")
     L.append("- **到达顺序**:文件序(已验证 4 条轨迹时间戳单调)")
     L.append(f"- **原始数据**:`{csv_path.name}`(含全部机制统计:demotions / evictions / ghost_hits / second_chances 等)")
     L.append("")
@@ -335,8 +344,8 @@ def report() -> None:
 
     L.append("## 2. 总块命中率(chunk hit rate)")
     L.append("")
-    L.append("| 轨迹 | 容量点 | 总容量 | Buoy | LRU | S3-FIFO |")
-    L.append("|---|---|---|---|---|---|")
+    L.append("| 轨迹 | 容量点 | 总容量 | Buoy | LRU | S3-FIFO | OPT |")
+    L.append("|---|---|---|---|---|---|---|")
     by_tc = {}
     for r in rows:
         by_tc.setdefault((r["trace"], r["cap_label"]), {})[r["policy"]] = r
@@ -345,7 +354,7 @@ def report() -> None:
             g = by_tc[(t, c)]
             L.append(f"| {t} | {c} | {_int(g['buoy']['total_capacity'])} "
                      f"| {_pct(g['buoy']['chunk_hit_rate'])} | {_pct(g['lru']['chunk_hit_rate'])} "
-                     f"| {_pct(g['s3fifo']['chunk_hit_rate'])} |")
+                     f"| {_pct(g['s3fifo']['chunk_hit_rate'])} | {_pct(g['opt']['chunk_hit_rate'])} |")
     L.append("")
 
     L.append("## 3. HBM / DRAM 命中分布")
@@ -392,26 +401,36 @@ def report() -> None:
     for t in TRACES:
         for c, _ in CAP_LABELS:
             g = by_tc[(t, c)]
-            best = max(POLICIES, key=lambda p: float(g[p]["chunk_hit_rate"]))
-            L.append(f"- **{t}/{c}**:最佳命中率 {_pct(g[best]['chunk_hit_rate'])}(by {best});"
-                     f"S3-FIFO 命中 {_pct(g['s3fifo']['chunk_hit_rate'])},"
-                     f"其中 {_pct(g['s3fifo']['dram_share_of_hits'])} 来自 DRAM")
+            opt_r = float(g["opt"]["chunk_hit_rate"])
+            online = max((p for p in POLICIES if p != "opt"),
+                         key=lambda p: float(g[p]["chunk_hit_rate"]))
+            on_r = float(g[online]["chunk_hit_rate"])
+            L.append(f"- **{t}/{c}**:OPT 上界 {_pct(opt_r)};在线最佳 {_pct(on_r)}(by {online}),"
+                     f"距最优 {(opt_r - on_r) * 100:.2f} pp;S3-FIFO 达到 OPT 的 "
+                     f"{float(g['s3fifo']['chunk_hit_rate']) / opt_r * 100:.1f}%,"
+                     f"其命中 {_pct(g['s3fifo']['dram_share_of_hits'])} 来自 DRAM")
     L.append("")
     lru_dem = sum(int(by_tc[(t, "medium")]["lru"]["demotions"]) for t in TRACES)
     s3_dem = sum(int(by_tc[(t, "medium")]["s3fifo"]["demotions"]) for t in TRACES)
     buoy_dem = sum(int(by_tc[(t, "medium")]["buoy"]["demotions"]) for t in TRACES)
+    opt_dem = sum(int(by_tc[(t, "medium")]["opt"]["demotions"]) for t in TRACES)
     L.append(f"- **HBM→DRAM 降配流量**(medium,4 轨迹求和):LRU {_int(lru_dem)},"
-             f"Buoy {_int(buoy_dem)},S3-FIFO {_int(s3_dem)}"
+             f"Buoy {_int(buoy_dem)},S3-FIFO {_int(s3_dem)},OPT(oracle) {_int(opt_dem)}"
              + (f";S3-FIFO 仅为 LRU 的 {s3_dem / lru_dem:.1%}" if lru_dem else ""))
     s3_hbm = sum(float(by_tc[(t, "medium")]["s3fifo"]["hbm_share_of_hits"]) for t in TRACES) / len(TRACES)
     lru_hbm = sum(float(by_tc[(t, "medium")]["lru"]["hbm_share_of_hits"]) for t in TRACES) / len(TRACES)
     buoy_hbm = sum(float(by_tc[(t, "medium")]["buoy"]["hbm_share_of_hits"]) for t in TRACES) / len(TRACES)
+    opt_hbm = sum(float(by_tc[(t, "medium")]["opt"]["hbm_share_of_hits"]) for t in TRACES) / len(TRACES)
     L.append(f"- **命中热度的分层分布**(medium 平均):Buoy 命中的 {_pct(buoy_hbm)} 落在 HBM,"
-             f"LRU {_pct(lru_hbm)},S3-FIFO 仅 {_pct(s3_hbm)} —— S3-FIFO 把 HBM 当作短试用期,"
-             f"热点迅速沉淀到 DRAM,HBM 写流量随之最小化")
+             f"LRU {_pct(lru_hbm)},S3-FIFO 仅 {_pct(s3_hbm)},"
+             f"OPT 的 oracle 放置为 {_pct(opt_hbm)}(HBM 命中份额的上界)—— "
+             "S3-FIFO 把 HBM 当作短试用期,热点迅速沉淀到 DRAM,HBM 写流量随之最小化")
     buoy_rej = sum(int(by_tc[(t, "medium")]["buoy"]["rejected_chunks"]) for t in TRACES)
     L.append(f"- **Buoy 的深度准入**在 medium 点共拒绝 {_int(buoy_rej)} 个 chunk,"
-             f"显著减少进入缓存的一次性访问(对照 S3-FIFO/LRU 全量准入)")
+             f"显著减少进入缓存的一次性访问(对照 S3-FIFO/LRU/OPT 全量准入)")
+    L.append("")
+    L.append("注:OPT 的 demotion 为 oracle 换入换出流量(每次 DRAM 命中至多触发一次),"
+             "与在线策略“溢出时降配”的口径不同,算法间比较以命中率与分层命中份额为主。")
 
     (OUT / "REPORT.md").write_text("\n".join(L) + "\n", encoding="utf-8")
     print(f"wrote {csv_path}\nwrote {OUT / 'REPORT.md'}")

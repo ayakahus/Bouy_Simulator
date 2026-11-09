@@ -1,8 +1,12 @@
-"""Cache replacement policies: Buoy, LRU, and S3-FIFO."""
+"""Cache replacement policies: Buoy, LRU, S3-FIFO, and Belady OPT."""
 from __future__ import annotations
+import heapq
+from array import array
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Optional
+
+_INF = 1 << 62  # OPT sentinel: "never accessed again" (fits int64)
 
 @dataclass
 class Chunk:
@@ -446,3 +450,198 @@ class S3FIFOPolicy:
             "move_to_main_threshold": self.move_to_main_threshold,
             "stats": self.stats,
         }
+
+class OPTPolicy:
+    """Belady's optimal replacement (MIN, 1966) with oracle two-tier placement.
+
+    Residency: strict MIN over the total capacity ``C = hbm_capacity +
+    dram_capacity`` — on overflow the resident chunk whose NEXT access lies
+    farthest in the future (never = infinity) is evicted. The resulting hit
+    rate is the theoretical upper bound for any policy with the same total
+    capacity, online or offline, which is exactly why this policy exists in
+    the comparison.
+
+    Tier placement (oracle, pull-only): a hit is counted in the tier the chunk
+    resides in; afterwards a DRAM-resident chunk whose next use is sooner than
+    the farthest next use in HBM is swapped into HBM while the HBM worst chunk
+    moves to DRAM (one ``demotion``). HBM therefore concentrates the chunks
+    needed soonest; the mirror operation (pushing stale HBM chunks out on
+    their own) is not performed, so the HBM/DRAM split is near-optimal rather
+    than exactly optimal. Total hit rate is unaffected by placement.
+
+    Offline: requires ``prepare(chunk_reqs)`` with the full request sequence
+    before the first ``access_request`` call.
+    """
+
+    name = "opt"
+
+    def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 0, **kwargs):
+        if hbm_capacity < 0 or dram_capacity < 0:
+            raise ValueError("capacities must be >= 0")
+        self.hcap, self.mcap = hbm_capacity, dram_capacity
+        self.gcap = 0  # OPT needs no ghost; the parameter is accepted for interface compatibility
+        # OrderedDict order carries no meaning here (victims come from the heaps).
+        self.hbm: OrderedDict[str, Chunk] = OrderedDict()
+        self.dram: OrderedDict[str, Chunk] = OrderedDict()
+        self.next_use: dict[str, int] = {}  # cid -> current next-access position (residents only)
+        self._global: list = []             # (-next_use, cid) max-heap over all residents
+        self._hbm_heap: list = []           # (-next_use, cid) max-heap over HBM residents
+        self._next = None                   # array('q'); set by prepare()
+        self._cursor = 0
+        self._prepared = False
+        self.stats = dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
+                          admitted_chunks=0, rejected_chunks=0, evictions=0,
+                          demotions=0, ghost_hits=0, second_chances=0)
+
+    # ---- offline preparation ----------------------------------------------------
+    def prepare(self, chunk_reqs) -> None:
+        """Record the next-access position of every chunk access (one backward pass)."""
+        n_total = sum(len(req) for req in chunk_reqs)
+        nxt = array("q", [0]) * n_total  # every position is overwritten below
+        last: dict[str, int] = {}
+        i = n_total
+        for req in reversed(chunk_reqs):
+            for cid in reversed(req):
+                i -= 1
+                nxt[i] = last.get(cid, _INF)
+                last[cid] = i
+        self._next = nxt
+        self._cursor = 0
+        self._prepared = True
+
+    # ---- heap helpers (lazy deletion; validity = entry matches next_use + residency)
+    def _set_next_use(self, cid: str, u: int) -> None:
+        self.next_use[cid] = u
+        heapq.heappush(self._global, (-u, cid))
+        if cid in self.hbm:
+            heapq.heappush(self._hbm_heap, (-u, cid))
+
+    def _hbm_worst(self) -> int:
+        """Largest next_use among valid HBM residents."""
+        h = self._hbm_heap
+        while h:
+            negu, vid = h[0]
+            cur = self.next_use.get(vid)
+            if cur is not None and vid in self.hbm and -negu == cur:
+                return -negu
+            heapq.heappop(h)
+        return _INF
+
+    def _pop_hbm_worst(self) -> str:
+        h = self._hbm_heap
+        while h:
+            negu, vid = h[0]
+            cur = self.next_use.get(vid)
+            if cur is not None and vid in self.hbm and -negu == cur:
+                heapq.heappop(h)
+                return vid
+            heapq.heappop(h)
+        raise RuntimeError("OPT: HBM overflow but no valid HBM entry")
+
+    def _evict_min(self) -> None:
+        """Evict the resident chunk with the farthest next use (the MIN victim)."""
+        g = self._global
+        while g:
+            negu, vid = g[0]
+            cur = self.next_use.get(vid)
+            if cur is not None and -negu == cur and (vid in self.hbm or vid in self.dram):
+                heapq.heappop(g)
+                if vid in self.hbm:
+                    del self.hbm[vid]
+                else:
+                    del self.dram[vid]
+                del self.next_use[vid]
+                self.stats["evictions"] += 1
+                return
+            heapq.heappop(g)
+        raise RuntimeError("OPT: cache overflow but no valid resident entry")
+
+    def _pull_into_hbm(self, cid: str, node: Chunk, u: int) -> None:
+        """Move a DRAM-resident chunk into HBM (swap with the HBM worst if full)."""
+        del self.dram[cid]
+        if len(self.hbm) < self.hcap:
+            self.hbm[cid] = node
+            heapq.heappush(self._hbm_heap, (-u, cid))
+            return
+        victim = self._pop_hbm_worst()
+        victim_node = self.hbm.pop(victim)
+        self.hbm[cid] = node
+        self.dram[victim] = victim_node
+        heapq.heappush(self._hbm_heap, (-u, cid))
+        self.stats["demotions"] += 1
+
+    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+        """Process one request's prefix chunks in root-to-leaf order."""
+        if not self._prepared:
+            raise RuntimeError("OPTPolicy.prepare(chunk_reqs) must run before replay")
+        self.stats["total_chunks"] += len(chunks)
+        hbm_hits = dram_hits = misses = hits_tokens = 0
+        capacity = self.hcap + self.mcap
+        nxt = self._next
+        n_prepared = len(nxt)
+        for cid, depth, token_count in chunks:
+            i = self._cursor
+            self._cursor += 1
+            u = nxt[i] if i < n_prepared else _INF
+            node = self.hbm.get(cid)
+            if node is not None:
+                # Hit in HBM: only the recorded next use moves.
+                node.depth, node.token_count = depth, token_count
+                hbm_hits += 1
+                hits_tokens += token_count
+                self._set_next_use(cid, u)
+                continue
+            node = self.dram.get(cid)
+            if node is not None:
+                # Hit in DRAM: counted here, then pulled into HBM when its next
+                # use beats the HBM worst (oracle placement, pull-only).
+                node.depth, node.token_count = depth, token_count
+                dram_hits += 1
+                hits_tokens += token_count
+                self._set_next_use(cid, u)
+                if self.hcap > 0 and (len(self.hbm) < self.hcap or u < self._hbm_worst()):
+                    self._pull_into_hbm(cid, node, u)
+                continue
+            misses += 1
+            self.stats["misses"] += 1
+            if capacity > 0 and len(self.hbm) + len(self.dram) >= capacity:
+                self._evict_min()
+            if self.hcap > 0:
+                self.hbm[cid] = Chunk(cid, depth, token_count)
+                self._set_next_use(cid, u)
+                self.stats["admitted_chunks"] += 1
+                while len(self.hbm) > self.hcap:
+                    # Tier overflow: sink the HBM-worst chunk into DRAM (demote),
+                    # or evict outright when there is no DRAM tier.
+                    worst = self._pop_hbm_worst()
+                    worst_node = self.hbm.pop(worst)
+                    if self.mcap > 0:
+                        self.dram[worst] = worst_node
+                        self.stats["demotions"] += 1
+                    else:
+                        del self.next_use[worst]
+                        self.stats["evictions"] += 1
+            elif self.mcap > 0:
+                self.dram[cid] = Chunk(cid, depth, token_count)
+                self._set_next_use(cid, u)
+                self.stats["admitted_chunks"] += 1
+            # else: no capacity configured anywhere; count as a miss only.
+            while len(self.dram) > self.mcap:  # defensive; unreachable when the invariant holds
+                self._evict_min()
+        self.stats["hbm_hits"] += hbm_hits
+        self.stats["dram_hits"] += dram_hits
+        return dict(hbm_hits=hbm_hits, dram_hits=dram_hits, misses=misses,
+                    hit_chunks=hbm_hits + dram_hits, hit_tokens=hits_tokens,
+                    request_tokens=sum(c[2] for c in chunks))
+
+    def snapshot(self):
+        return {
+            "policy": self.name,
+            "note": "tier order is unordered for opt (heap-driven placement)",
+            "hbm_oldest_to_newest": [{"chunk_id": c, "depth": n.depth, "next_use": self.next_use.get(c)} for c, n in self.hbm.items()],
+            "dram_oldest_to_newest": [{"chunk_id": c, "depth": n.depth, "next_use": self.next_use.get(c)} for c, n in self.dram.items()],
+            "ghost_oldest_to_newest": [],
+            "stats": self.stats,
+        }
+
+

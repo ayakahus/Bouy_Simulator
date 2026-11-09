@@ -9,8 +9,11 @@ def run_policy(requests: list[Request], policy, block_size: int) -> tuple[dict, 
     rows = []
     total_prompt_tokens = total_hit_tokens = total_chunks = total_hits = 0
     total_hbm = total_dram = total_misses = 0
-    for req in requests:
-        chunks = prefix_chunks(req.tokens, block_size)
+    all_chunks = [prefix_chunks(req.tokens, block_size) for req in requests]
+    if hasattr(policy, "prepare"):
+        # Offline policies (Belady OPT) need the full access sequence up front.
+        policy.prepare(all_chunks)
+    for req, chunks in zip(requests, all_chunks):
         result = policy.access_request(chunks)
         n = len(chunks)
         total_prompt_tokens += len(req.tokens)

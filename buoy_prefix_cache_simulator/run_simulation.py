@@ -2,14 +2,14 @@
 import argparse, json
 from pathlib import Path
 from buoy_sim.trace import load_trace
-from buoy_sim.policies import BuoyPolicy, LRUPolicy, S3FIFOPolicy
+from buoy_sim.policies import BuoyPolicy, LRUPolicy, OPTPolicy, S3FIFOPolicy
 from buoy_sim.simulator import run_policy, write_csv
 
 def main():
     p = argparse.ArgumentParser(description="Replay an LLM prefix-cache trace with Buoy, LRU, and/or S3-FIFO.")
     p.add_argument("--trace", required=True, help="Input .jsonl, .json, or .csv trace")
-    p.add_argument("--policy", choices=["buoy", "lru", "s3fifo", "both", "all"], default="buoy",
-                   help="'both' = buoy+lru, 'all' = buoy+lru+s3fifo")
+    p.add_argument("--policy", choices=["buoy", "lru", "s3fifo", "opt", "both", "all"], default="buoy",
+                   help="'both' = buoy+lru, 'all' = buoy+lru+s3fifo+opt")
     p.add_argument("--hbm-capacity", type=int, default=1024, help="HBM capacity in chunks")
     p.add_argument("--dram-capacity", type=int, default=4096, help="DRAM capacity in chunks")
     p.add_argument("--ghost-capacity", type=int, default=4096, help="Ghost FIFO capacity in IDs")
@@ -34,6 +34,8 @@ def main():
     if args.policy in ("s3fifo", "all"):
         policies.append(S3FIFOPolicy(args.hbm_capacity, args.dram_capacity, args.ghost_capacity,
                                      move_to_main_threshold=args.move_to_main_threshold))
+    if args.policy in ("opt", "all"):
+        policies.append(OPTPolicy(args.hbm_capacity, args.dram_capacity))
     summaries = []
     for policy in policies:
         summary, rows = run_policy(requests, policy, args.block_size)
