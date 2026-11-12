@@ -17,6 +17,9 @@ def main():
     p.add_argument("--initial-depth-threshold", type=int, default=1)
     p.add_argument("--move-to-main-threshold", type=int, default=1,
                    help="S3-FIFO: re-accesses inside HBM required before promotion to DRAM")
+    p.add_argument("--request-constraint", action="store_true",
+                   help="pin all chunks of the request being processed (they cannot be "
+                        "evicted until the request completes; missing chunks force-admitted)")
     p.add_argument("--disable-admission", action="store_true")
     p.add_argument("--output-dir", default="results")
     args = p.parse_args()
@@ -28,14 +31,18 @@ def main():
     policies = []
     if args.policy in ("buoy", "both", "all"):
         policies.append(BuoyPolicy(args.hbm_capacity, args.dram_capacity, args.ghost_capacity,
-                                   args.initial_depth_threshold, admission=not args.disable_admission))
+                                   args.initial_depth_threshold, admission=not args.disable_admission,
+                                   request_constraint=args.request_constraint))
     if args.policy in ("lru", "both", "all"):
-        policies.append(LRUPolicy(args.hbm_capacity, args.dram_capacity))
+        policies.append(LRUPolicy(args.hbm_capacity, args.dram_capacity,
+                                  request_constraint=args.request_constraint))
     if args.policy in ("s3fifo", "all"):
         policies.append(S3FIFOPolicy(args.hbm_capacity, args.dram_capacity, args.ghost_capacity,
-                                     move_to_main_threshold=args.move_to_main_threshold))
+                                     move_to_main_threshold=args.move_to_main_threshold,
+                                     request_constraint=args.request_constraint))
     if args.policy in ("opt", "all"):
-        policies.append(OPTPolicy(args.hbm_capacity, args.dram_capacity))
+        policies.append(OPTPolicy(args.hbm_capacity, args.dram_capacity,
+                                  request_constraint=args.request_constraint))
     summaries = []
     for policy in policies:
         summary, rows = run_policy(requests, policy, args.block_size)

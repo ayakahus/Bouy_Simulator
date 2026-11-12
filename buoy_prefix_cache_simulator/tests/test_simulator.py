@@ -138,5 +138,56 @@ class SimulatorTests(unittest.TestCase):
         self.assertIn(cids[4][0], p.hbm)   # a pulled into HBM by the oracle
         self.assertIn(cids[1][0], p.dram)  # b (stale next use) sunk to DRAM
 
+    def test_s3fifo_constraint_demotes_pinned_cold_chunk(self):
+        # Under the request-level constraint a pinned cold chunk cannot be
+        # evicted from the small queue: it is demoted to DRAM instead, so the
+        # next request for it still hits (it would have been evicted without
+        # the constraint).
+        p = S3FIFOPolicy(1, 2, ghost_capacity=8, request_constraint=True)
+        c1 = prefix_chunks(["x"], 1)[0]
+        c2 = prefix_chunks(["y"], 1)[0]
+        p.access_request([c1, c2])   # both pinned; c1 overflows HBM -> demoted
+        self.assertEqual(p.stats["demotions"], 1)
+        self.assertEqual(p.stats["evictions"], 0)
+        self.assertIn(c1[0], p.dram)
+        result = p.access_request([c1])
+        self.assertEqual(result["dram_hits"], 1)
+
+    def test_buoy_constraint_forces_admission(self):
+        # Depth admission would reject deep cold chunks; the constraint
+        # force-admits every chunk of the current request.
+        p = BuoyPolicy(2, 4, ghost_capacity=8, request_constraint=True)
+        chunks = prefix_chunks(["a", "b", "c", "d", "e"], 1)  # depths 1..5
+        p.access_request(chunks)
+        self.assertEqual(p.stats["rejected_chunks"], 0)
+        resident = set(p.hbm) | set(p.dram)
+        self.assertTrue(all(cid in resident for cid, _, _ in chunks))
+        self.assertLessEqual(len(resident), 6)
+
+    def test_opt_constraint_protects_request_chunks(self):
+        # R1={a,b,c}, R2={d}, R3={a,e}: at R3's miss the farthest-next-use
+        # victims include "a" itself (INF); the constraint keeps it resident
+        # and only non-pinned chunks are evicted.
+        p = OPTPolicy(1, 2, request_constraint=True)
+        reqs = [prefix_chunks(list(toks), 1) for toks in ["abc", "d", "ae"]]
+        p.prepare(reqs)
+        p.access_request(reqs[0])
+        p.access_request(reqs[1])
+        p.access_request(reqs[2])
+        resident = set(p.hbm) | set(p.dram)
+        self.assertIn(reqs[2][0][0], resident)  # "a" still cached
+        self.assertIn(reqs[2][1][0], resident)  # "e" cached
+        self.assertLessEqual(len(resident), 3)
+
+    def test_opt_constraint_waives_oversized_request(self):
+        # A request longer than the total capacity cannot satisfy the
+        # constraint and is processed unpinned (constraint_waived).
+        p = OPTPolicy(1, 1, request_constraint=True)
+        req = prefix_chunks(["a", "b", "c"], 1)
+        p.prepare([req])
+        p.access_request(req)
+        self.assertEqual(p.stats["constraint_waived"], 1)
+        self.assertLessEqual(len(p.hbm) + len(p.dram), 2)
+
 if __name__ == "__main__":
     unittest.main()

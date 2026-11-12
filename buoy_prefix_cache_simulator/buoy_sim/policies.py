@@ -1,4 +1,6 @@
-"""Cache replacement policies: Buoy, LRU, S3-FIFO, and Belady OPT."""
+"""Cache replacement policies: Buoy, LRU, S3-FIFO, Belady OPT, with an
+optional request-level residency constraint (all chunks of the request being
+processed stay in the cache until the request completes)."""
 from __future__ import annotations
 import heapq
 from array import array
@@ -16,16 +18,49 @@ class Chunk:
     visited: bool = False
     freq: int = 0  # S3-FIFO frequency counter (unused by Buoy/LRU)
 
-class BuoyPolicy:
+class _RequestConstraintMixin:
+    """Request-level residency constraint.
+
+    While a request is being processed, all of its chunks are *pinned*: the
+    policy's eviction paths must not remove them from the cache (tier moves
+    HBM<->DRAM stay allowed) and missing chunks are force-admitted (Buoy's
+    depth admission is bypassed for the current request). The pin is released
+    when the request completes. A request longer than the total capacity
+    cannot satisfy the constraint and is processed unpinned instead
+    (counted in ``constraint_waived``).
+    """
+
+    _pinned: set
+    request_constraint: bool
+
+    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+        if not self.request_constraint:
+            return self._access_request_impl(chunks)
+        if len(chunks) > self.hcap + self.mcap:
+            # Infeasible: the request alone exceeds the total capacity.
+            self.stats["constraint_waived"] += 1
+            return self._access_request_impl(chunks)
+        pinned = {c[0] for c in chunks}
+        self._pinned |= pinned
+        try:
+            return self._access_request_impl(chunks)
+        finally:
+            self._pinned -= pinned
+
+
+class BuoyPolicy(_RequestConstraintMixin):
     name = "buoy"
 
     def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 4096,
-                 initial_depth_threshold: int = 1, admission: bool = True):
+                 initial_depth_threshold: int = 1, admission: bool = True,
+                 request_constraint: bool = False):
         if hbm_capacity < 0 or dram_capacity < 0 or ghost_capacity < 0:
             raise ValueError("capacities must be >= 0")
         self.hcap, self.mcap, self.gcap = hbm_capacity, dram_capacity, ghost_capacity
         self.initial_threshold = max(1, initial_depth_threshold)
         self.admission = admission
+        self.request_constraint = request_constraint
+        self._pinned: set = set()
         # OrderedDict order: oldest/tail at beginning, newest/head at end.
         self.hbm: OrderedDict[str, Chunk] = OrderedDict()
         self.dram: OrderedDict[str, Chunk] = OrderedDict()
@@ -39,7 +74,8 @@ class BuoyPolicy:
     def _new_stats():
         return dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
                     admitted_chunks=0, rejected_chunks=0, evictions=0,
-                    demotions=0, ghost_hits=0, second_chances=0)
+                    demotions=0, ghost_hits=0, second_chances=0,
+                    constraint_waived=0)
 
     @property
     def depth_threshold(self) -> int:
@@ -88,8 +124,15 @@ class BuoyPolicy:
     def _trim_dram(self):
         # Capacity is a maximum resident count. Visited entries receive a second chance.
         if self.mcap == 0:
-            while self.dram:
+            rotations = 0
+            while self.dram and rotations <= len(self.dram):
                 cid, node = self.dram.popitem(last=False)
+                if cid in self._pinned:
+                    # Request-level constraint: pinned chunks cannot be evicted;
+                    # rotate past them (they stay resident even with mcap == 0).
+                    self.dram[cid] = node
+                    rotations += 1
+                    continue
                 if node.visited:
                     node.visited = False
                     self.stats["second_chances"] += 1
@@ -99,15 +142,23 @@ class BuoyPolicy:
                     self.stats["evictions"] += 1
             return
         guard = 0
+        rotations = 0
         while len(self.dram) > self.mcap:
             guard += 1
+            cid, node = self.dram.popitem(last=False)
+            if cid in self._pinned:
+                # Request-level constraint: pinned chunks cannot be evicted;
+                # rotate to the tail (FIFO position refreshed, still resident).
+                self._insert_head(self.dram, node)
+                rotations += 1
+                if rotations > len(self.dram):
+                    break  # defensive: every DRAM chunk is pinned
+                continue
             if guard > max(10, 4 * (len(self.dram) + 1)):
                 # Defensive guard for pathological zero/equal-capacity configurations.
-                cid, node = self.dram.popitem(last=False)
                 self._ghost_add(cid)
                 self.stats["evictions"] += 1
                 continue
-            cid, node = self.dram.popitem(last=False)
             if node.visited:
                 node.visited = False
                 self.stats["second_chances"] += 1
@@ -120,7 +171,7 @@ class BuoyPolicy:
         while len(self.hbm) > self.hcap:
             self._evict_hbm()
 
-    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+    def _access_request_impl(self, chunks: list[tuple[str, int, int]]) -> dict:
         """Process one request's prefix chunks in root-to-leaf order."""
         self.stats["total_chunks"] += len(chunks)
         hbm_hits = dram_hits = misses = hits_tokens = 0
@@ -154,7 +205,7 @@ class BuoyPolicy:
                     self._ghost_remove(cid)
                 node = Chunk(cid, depth, token_count, visited=in_ghost)
                 threshold = self.depth_threshold
-                if self.admission and depth > threshold and not in_ghost:
+                if self.admission and depth > threshold and not in_ghost and cid not in self._pinned:
                     self.stats["rejected_chunks"] += 1
                     self._ghost_add(cid)
                     continue
@@ -189,7 +240,7 @@ class BuoyPolicy:
             "stats": self.stats,
         }
 
-class LRUPolicy:
+class LRUPolicy(_RequestConstraintMixin):
     """Two-tier LRU baseline.
 
     HBM and DRAM are separate LRU queues with capacities ``hbm_capacity`` and
@@ -212,17 +263,21 @@ class LRUPolicy:
 
     name = "lru"
 
-    def __init__(self, hbm_capacity: int, dram_capacity: int = 0, ghost_capacity: int = 0, **kwargs):
+    def __init__(self, hbm_capacity: int, dram_capacity: int = 0, ghost_capacity: int = 0,
+                 request_constraint: bool = False, **kwargs):
         if hbm_capacity < 0 or dram_capacity < 0:
             raise ValueError("capacities must be >= 0")
         self.hcap = hbm_capacity
         self.mcap = dram_capacity
+        self.request_constraint = request_constraint
+        self._pinned: set = set()
         # OrderedDict order: oldest/LRU at the beginning, newest/MRU at the end.
         self.hbm: OrderedDict[str, Chunk] = OrderedDict()
         self.dram: OrderedDict[str, Chunk] = OrderedDict()
         self.stats = dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
                           admitted_chunks=0, rejected_chunks=0, evictions=0,
-                          demotions=0, ghost_hits=0, second_chances=0)
+                          demotions=0, ghost_hits=0, second_chances=0,
+                          constraint_waived=0)
 
     def _demote_hbm_overflow(self):
         """Move HBM LRU-tail chunks into DRAM instead of discarding them."""
@@ -236,11 +291,18 @@ class LRUPolicy:
                 self.stats["evictions"] += 1
 
     def _trim_dram(self):
-        while len(self.dram) > self.mcap:
-            self.dram.popitem(last=False)
+        rotations = 0
+        while len(self.dram) > self.mcap and rotations <= len(self.dram):
+            cid, node = self.dram.popitem(last=False)
+            if cid in self._pinned:
+                # Request-level constraint: pinned chunks cannot be evicted;
+                # rotate to the MRU tail (stays resident).
+                self.dram[cid] = node
+                rotations += 1
+                continue
             self.stats["evictions"] += 1
 
-    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+    def _access_request_impl(self, chunks: list[tuple[str, int, int]]) -> dict:
         hbm_hits = dram_hits = misses = hits_tokens = 0
         self.stats["total_chunks"] += len(chunks)
         for cid, depth, token_count in chunks:
@@ -282,7 +344,7 @@ class LRUPolicy:
             "stats": self.stats,
         }
 
-class S3FIFOPolicy:
+class S3FIFOPolicy(_RequestConstraintMixin):
     """S3-FIFO (Yang et al., "FIFO Queues Are All You Need for Cache Eviction",
     SOSP 2023) with HBM as the small FIFO and DRAM as the main FIFO.
 
@@ -310,13 +372,15 @@ class S3FIFOPolicy:
     name = "s3fifo"
 
     def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 4096,
-                 move_to_main_threshold: int = 1, **kwargs):
+                 move_to_main_threshold: int = 1, request_constraint: bool = False, **kwargs):
         if hbm_capacity < 0 or dram_capacity < 0 or ghost_capacity < 0:
             raise ValueError("capacities must be >= 0")
         self.hcap, self.mcap, self.gcap = hbm_capacity, dram_capacity, ghost_capacity
         # Paper default: one re-access inside the small queue promotes a chunk
         # to the main queue ("accessed at least twice" counting admission).
         self.move_to_main_threshold = max(1, move_to_main_threshold)
+        self.request_constraint = request_constraint
+        self._pinned: set = set()
         # OrderedDict order: oldest/tail at the beginning, newest/head at the end.
         self.hbm: OrderedDict[str, Chunk] = OrderedDict()
         self.dram: OrderedDict[str, Chunk] = OrderedDict()
@@ -324,7 +388,8 @@ class S3FIFOPolicy:
         self.ghost_set: set[str] = set()
         self.stats = dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
                           admitted_chunks=0, rejected_chunks=0, evictions=0,
-                          demotions=0, ghost_hits=0, second_chances=0)
+                          demotions=0, ghost_hits=0, second_chances=0,
+                          constraint_waived=0)
 
     # ---- ghost FIFO (IDs only) -------------------------------------------------
     def _ghost_contains(self, cid: str) -> bool:
@@ -364,12 +429,21 @@ class S3FIFOPolicy:
         Per the paper, main-queue evictions do NOT enter the ghost: only
         small-queue evictions do. The freq decrement guarantees termination;
         the guard mirrors BuoyPolicy's defense against pathological configs.
+        Pinned chunks (request-level constraint) receive unlimited second
+        chances — they are rotated to the tail without a freq decrement.
         """
         guard = 0
+        rotations = 0
         limit = max(10, 4 * (len(self.dram) + 1))
         while self.dram and len(self.dram) > self.mcap:
             guard += 1
             cid, node = self.dram.popitem(last=False)
+            if cid in self._pinned:
+                rotations += 1
+                self._insert_head(self.dram, node)
+                if rotations > len(self.dram):
+                    break  # defensive: every DRAM chunk is pinned
+                continue
             if node.freq >= 1 and guard <= limit:
                 node.freq -= 1
                 self.stats["second_chances"] += 1
@@ -384,7 +458,9 @@ class S3FIFOPolicy:
         semantics); never-re-accessed chunks are evicted and recorded in the
         ghost FIFO so a prompt re-request can skip the HBM trial queue. With
         ``dram_capacity == 0`` there is no main queue, so promotions degrade
-        to plain evictions.
+        to plain evictions. Under the request-level constraint a pinned cold
+        chunk cannot be evicted, so it is demoted to DRAM instead (it stays
+        resident; counted as a demotion).
         """
         while len(self.hbm) > self.hcap:
             cid, node = self.hbm.popitem(last=False)
@@ -393,11 +469,23 @@ class S3FIFOPolicy:
                 self._insert_head(self.dram, node)
                 self.stats["demotions"] += 1
                 self._trim_dram()
+            elif cid in self._pinned:
+                # Request-level constraint: pinned cold chunks stay in the
+                # cache — sink them to DRAM rather than evicting.
+                if self.mcap > 0:
+                    self._insert_head(self.dram, node)
+                    self.stats["demotions"] += 1
+                    self._trim_dram()
+                else:
+                    # No DRAM tier: unreachable when N <= C (hbm <= hcap = C);
+                    # rotate defensively and stop.
+                    self.hbm[cid] = node
+                    break
             else:
                 self._ghost_add(cid)
                 self.stats["evictions"] += 1
 
-    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+    def _access_request_impl(self, chunks: list[tuple[str, int, int]]) -> dict:
         """Process one request's prefix chunks in root-to-leaf order."""
         self.stats["total_chunks"] += len(chunks)
         hbm_hits = dram_hits = misses = hits_tokens = 0
@@ -451,7 +539,7 @@ class S3FIFOPolicy:
             "stats": self.stats,
         }
 
-class OPTPolicy:
+class OPTPolicy(_RequestConstraintMixin):
     """Belady's optimal replacement (MIN, 1966) with oracle two-tier placement.
 
     Residency: strict MIN over the total capacity ``C = hbm_capacity +
@@ -475,11 +563,14 @@ class OPTPolicy:
 
     name = "opt"
 
-    def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 0, **kwargs):
+    def __init__(self, hbm_capacity: int, dram_capacity: int, ghost_capacity: int = 0,
+                 request_constraint: bool = False, **kwargs):
         if hbm_capacity < 0 or dram_capacity < 0:
             raise ValueError("capacities must be >= 0")
         self.hcap, self.mcap = hbm_capacity, dram_capacity
         self.gcap = 0  # OPT needs no ghost; the parameter is accepted for interface compatibility
+        self.request_constraint = request_constraint
+        self._pinned: set = set()
         # OrderedDict order carries no meaning here (victims come from the heaps).
         self.hbm: OrderedDict[str, Chunk] = OrderedDict()
         self.dram: OrderedDict[str, Chunk] = OrderedDict()
@@ -491,7 +582,8 @@ class OPTPolicy:
         self._prepared = False
         self.stats = dict(total_chunks=0, hbm_hits=0, dram_hits=0, misses=0,
                           admitted_chunks=0, rejected_chunks=0, evictions=0,
-                          demotions=0, ghost_hits=0, second_chances=0)
+                          demotions=0, ghost_hits=0, second_chances=0,
+                          constraint_waived=0)
 
     # ---- offline preparation ----------------------------------------------------
     def prepare(self, chunk_reqs) -> None:
@@ -527,24 +619,39 @@ class OPTPolicy:
             heapq.heappop(h)
         return _INF
 
-    def _pop_hbm_worst(self) -> str:
+    def _pop_hbm_worst(self, skip_pinned: bool = False) -> str:
         h = self._hbm_heap
+        stash = []
         while h:
             negu, vid = h[0]
             cur = self.next_use.get(vid)
-            if cur is not None and vid in self.hbm and -negu == cur:
+            if (cur is not None and vid in self.hbm and -negu == cur
+                    and not (skip_pinned and vid in self._pinned)):
                 heapq.heappop(h)
+                for entry in stash:
+                    heapq.heappush(h, entry)
                 return vid
             heapq.heappop(h)
+        for entry in stash:
+            heapq.heappush(h, entry)
         raise RuntimeError("OPT: HBM overflow but no valid HBM entry")
 
     def _evict_min(self) -> None:
-        """Evict the resident chunk with the farthest next use (the MIN victim)."""
+        """Evict the resident chunk with the farthest next use (the MIN victim).
+
+        Pinned chunks (request-level constraint) are skipped: their heap
+        entries are stashed and re-pushed so they stay evictable later.
+        """
         g = self._global
+        stash = []
         while g:
             negu, vid = g[0]
             cur = self.next_use.get(vid)
             if cur is not None and -negu == cur and (vid in self.hbm or vid in self.dram):
+                if vid in self._pinned:
+                    # Protected: look past it, but keep its heap entry alive.
+                    stash.append(heapq.heappop(g))
+                    continue
                 heapq.heappop(g)
                 if vid in self.hbm:
                     del self.hbm[vid]
@@ -552,8 +659,12 @@ class OPTPolicy:
                     del self.dram[vid]
                 del self.next_use[vid]
                 self.stats["evictions"] += 1
+                for entry in stash:
+                    heapq.heappush(g, entry)
                 return
             heapq.heappop(g)
+        for entry in stash:
+            heapq.heappush(g, entry)
         raise RuntimeError("OPT: cache overflow but no valid resident entry")
 
     def _pull_into_hbm(self, cid: str, node: Chunk, u: int) -> None:
@@ -570,7 +681,7 @@ class OPTPolicy:
         heapq.heappush(self._hbm_heap, (-u, cid))
         self.stats["demotions"] += 1
 
-    def access_request(self, chunks: list[tuple[str, int, int]]) -> dict:
+    def _access_request_impl(self, chunks: list[tuple[str, int, int]]) -> dict:
         """Process one request's prefix chunks in root-to-leaf order."""
         if not self._prepared:
             raise RuntimeError("OPTPolicy.prepare(chunk_reqs) must run before replay")
@@ -612,8 +723,9 @@ class OPTPolicy:
                 self.stats["admitted_chunks"] += 1
                 while len(self.hbm) > self.hcap:
                     # Tier overflow: sink the HBM-worst chunk into DRAM (demote),
-                    # or evict outright when there is no DRAM tier.
-                    worst = self._pop_hbm_worst()
+                    # or evict outright when there is no DRAM tier (skipping
+                    # pinned chunks under the request-level constraint).
+                    worst = self._pop_hbm_worst(skip_pinned=(self.mcap == 0))
                     worst_node = self.hbm.pop(worst)
                     if self.mcap > 0:
                         self.dram[worst] = worst_node
